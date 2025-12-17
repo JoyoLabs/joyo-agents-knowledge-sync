@@ -32,6 +32,12 @@ curl -X POST https://us-central1-slack-agent-hub.cloudfunctions.net/syncSlack
 # Check sync status
 curl https://us-central1-slack-agent-hub.cloudfunctions.net/getSyncStatus
 
+# Stop a running Notion sync (graceful, ~30s max wait)
+curl -X POST https://us-central1-slack-agent-hub.cloudfunctions.net/stopNotionSync
+
+# Reset Notion sync state (if stuck)
+curl -X POST https://us-central1-slack-agent-hub.cloudfunctions.net/resetNotionSync
+
 # Cleanup (reset Firestore, optionally delete vector store)
 npx ts-node scripts/cleanup.ts
 npx ts-node scripts/cleanup.ts --delete-store
@@ -45,32 +51,76 @@ src/
 ├── config.ts                       # Environment variable loading
 ├── types/index.ts                  # All TypeScript interfaces
 ├── sync/
-│   ├── notion.sync.ts              # Notion sync (4-phase)
+│   ├── notion.sync.ts              # Notion sync (streaming, resumable)
 │   └── slack.sync.ts               # Slack sync (3-phase)
 ├── processors/
-│   └── vectorStore.processor.ts    # Parallel async OpenAI uploads
+│   └── vectorStore.processor.ts    # OpenAI uploads (single + batch)
 └── services/
-    └── firestore.service.ts        # State tracking, change detection
+    └── firestore.service.ts        # State tracking, checkpoints, change detection
 ```
 
-## Sync Flow
+## Notion Sync (Streaming Architecture)
 
-### Notion Sync (4 phases)
+The Notion sync uses a **streaming, resumable architecture** to handle large workspaces without OOM issues:
 
-1. **Discover** - Fetch all page metadata via Search API (~30s for 2000+ results)
-2. **Diff** - Compare with Firestore to find adds/updates/deletes
-3. **Fetch Content** - Get block content for changed pages (3x concurrent)
-4. **Process** - Upload to OpenAI Vector Store (10x concurrent, non-blocking)
+### Flow
 
-**Important:** Only syncs actual pages (`workspace`, `page_id`, `block_id` parents). Excludes `database_id` parents (database rows) which may contain sensitive data like credentials or automated logs.
+```
+1. INITIALIZE
+   └─► Check if resuming from previous run (has cursor?)
+   └─► If yes: resume from cursor
+   └─► If no: start fresh, record syncStartTime
 
-### Slack Sync (3 phases)
+2. LOOP: Process 20 pages at a time
+   └─► Fetch chunk from Notion API (sorted by last_edited_time DESC)
+   └─► For each page:
+       • NEW? → fetch content, upload to OpenAI, create Firestore doc
+       • UPDATED? → fetch content, delete old file, upload new, update doc
+       • UNCHANGED? → just mark lastSeenAt
+   └─► Save checkpoint (cursor + stats) → safe to kill after this
+   └─► Check kill switch → if stopRequested, exit gracefully
+   └─► Check timeout → if near 55 min, exit gracefully
+
+3. DELETE STALE
+   └─► Query docs where lastSeenAt < syncStartTime
+   └─► These are pages deleted from Notion → delete from OpenAI + Firestore
+
+4. COMPLETE
+   └─► Clear cursor, update status to 'completed'
+```
+
+### Key Features
+
+- **Streaming**: Never holds all pages in memory. Processes 20 pages at a time.
+- **Resumable**: Saves cursor after each chunk. Can resume from any point.
+- **Killable**: Check `stopRequested` flag after each chunk (~30s max to stop).
+- **Timeout-aware**: Exits gracefully at 55 min, resumes next run.
+- **Delete detection**: Uses `lastSeenAt` timestamp on each document.
+
+### Memory Usage
+
+| Component | Memory |
+|-----------|--------|
+| Current chunk (20 pages metadata) | ~50KB |
+| Content for changed pages (~5) | ~500KB |
+| **Total** | < 1MB |
+
+### Control Endpoints
+
+| Endpoint | Purpose |
+|----------|---------|
+| `POST /syncNotion` | Start or resume sync |
+| `POST /stopNotionSync` | Set stop flag (graceful stop in ~30s) |
+| `POST /resetNotionSync` | Clear all state, start fresh |
+| `GET /getSyncStatus` | View current progress |
+
+## Slack Sync (3 phases)
 
 1. **Discover** - Fetch new messages since last sync
 2. **Build Operations** - Create upload queue for new messages
 3. **Process** - Upload to OpenAI Vector Store (10x concurrent)
 
-Messages are immutable - no update/delete detection needed.
+Messages are treated as immutable - no update/delete detection.
 
 ## Key Design Decisions
 
@@ -94,59 +144,63 @@ Excluded:
 - System messages (joins, leaves, channel updates)
 - Short messages <50 chars (reactions, acknowledgments)
 
-### Async Vector Store Uploads
-OpenAI file uploads don't block on processing. Files are uploaded in parallel (10 concurrent) without waiting for vector store indexing to complete.
+### Document State Tracking
+Each `KnowledgeDocument` tracks its own state:
+- `lastSeenAt`: When it was last confirmed to exist in the source
+- `contentHash`: For detecting content changes
+- `vectorStoreFileId`: OpenAI file ID
 
 ### Incremental Sync
-- **Notion**: Uses content hash to detect changes. Deletes old file, uploads new on change.
-- **Slack**: Checks if message exists in Firestore. Messages are immutable.
+- **Notion**: Uses `lastEditedTime` comparison + content hash.
+- **Slack**: Checks if message exists in Firestore.
 
 ## Firestore Collections
 
-- `knowledge_sync_state`: Tracks last sync timestamp per source (`notion`, `slack`)
-- `knowledge_documents`: Tracks each synced document with content hash and vector store file ID
+### `knowledge_sync_state`
+Tracks sync progress per source:
+```typescript
+{
+  status: 'idle' | 'running' | 'completed' | 'failed',
+  lastSyncTimestamp: string,
+  totalDocuments: number,
+  cursor?: string,           // For resuming Notion sync
+  syncStartTime?: string,    // For delete detection
+  stopRequested?: boolean,   // Kill switch
+  stats?: { processed, added, updated, unchanged, deleted, errored }
+}
+```
+
+### `knowledge_documents`
+Each synced document:
+```typescript
+{
+  sourceType: 'notion' | 'slack',
+  sourceId: string,
+  vectorStoreFileId: string,
+  title: string,
+  url: string,
+  lastModified: string,
+  contentHash: string,
+  lastSeenAt: string,        // For delete detection
+  createdAt: string,
+  updatedAt: string
+}
+```
 
 ## Cloud Functions
 
-| Function | Purpose | Scheduler |
-|----------|---------|-----------|
-| `syncNotion` | Sync all Notion pages | `notion-sync-scheduler` (daily at 00:00 UTC) |
-| `syncSlack` | Sync all Slack messages | `slack-sync-scheduler` (daily at 00:30 UTC) |
-| `getSyncStatus` | Returns current sync state | Manual only |
+| Function | Purpose | Timeout |
+|----------|---------|---------|
+| `syncNotion` | Stream sync Notion pages | 60 min |
+| `syncSlack` | Sync Slack messages | 60 min |
+| `getSyncStatus` | Return current state | 60s |
+| `stopNotionSync` | Request graceful stop | 60s |
+| `resetNotionSync` | Reset sync state | 60s |
 
 ## Deployment
 
-Use the deploy script for parallel deployment (~2 min total):
-
 ```bash
 ./scripts/deploy.sh
-```
-
-To set up schedulers (one-time):
-
-```bash
-# Notion sync - daily at midnight UTC
-gcloud scheduler jobs create http notion-sync-scheduler \
-  --schedule="0 0 * * *" \
-  --uri="https://us-central1-slack-agent-hub.cloudfunctions.net/syncNotion" \
-  --http-method=POST --location=us-central1 --project=slack-agent-hub
-
-# Slack sync - daily at 00:30 UTC (offset from Notion)
-gcloud scheduler jobs create http slack-sync-scheduler \
-  --schedule="30 0 * * *" \
-  --uri="https://us-central1-slack-agent-hub.cloudfunctions.net/syncSlack" \
-  --http-method=POST --location=us-central1 --project=slack-agent-hub
-```
-
-To manage schedulers:
-
-```bash
-# Pause/resume
-gcloud scheduler jobs pause notion-sync-scheduler --location=us-central1 --project=slack-agent-hub
-gcloud scheduler jobs resume notion-sync-scheduler --location=us-central1 --project=slack-agent-hub
-
-# List all
-gcloud scheduler jobs list --location=us-central1 --project=slack-agent-hub
 ```
 
 ## Environment Variables
@@ -161,6 +215,6 @@ For local dev, create `.env` file (already in .gitignore).
 
 ## Rate Limits
 
-- **Notion**: 3 requests/second - fetches run with 3x concurrency
+- **Notion**: 3 requests/second - single function with rate limiter
 - **Slack**: Tier-based - uses conservative 1 req/500ms
-- **OpenAI**: 10x concurrent uploads, retry with exponential backoff
+- **OpenAI**: Retry with exponential backoff

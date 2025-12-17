@@ -1,5 +1,5 @@
 import { Firestore, FieldValue } from '@google-cloud/firestore';
-import { SyncState, KnowledgeDocument } from '../types';
+import { SyncState, SyncStats, KnowledgeDocument } from '../types';
 
 const COLLECTION_SYNC_STATE = 'knowledge_sync_state';
 const COLLECTION_DOCUMENTS = 'knowledge_documents';
@@ -26,7 +26,7 @@ export class FirestoreService {
   async updateSyncState(source: 'notion' | 'slack', state: Partial<SyncState>): Promise<void> {
     const docRef = this.db.collection(COLLECTION_SYNC_STATE).doc(source);
     const doc = await docRef.get();
-    
+
     if (doc.exists) {
       await docRef.update(state);
     } else {
@@ -40,23 +40,43 @@ export class FirestoreService {
     }
   }
 
-  async startSync(source: 'notion' | 'slack'): Promise<void> {
+  async startSync(source: 'notion' | 'slack', syncStartTime: string): Promise<void> {
     await this.updateSyncState(source, {
       status: 'running',
       lastRunAt: new Date().toISOString(),
+      syncStartTime,
+      cursor: null,
+      stopRequested: false,
+      stats: { processed: 0, added: 0, updated: 0, unchanged: 0, deleted: 0, errored: 0 },
+    });
+  }
+
+  async saveCheckpoint(
+    source: 'notion' | 'slack',
+    cursor: string | null,
+    stats: SyncStats
+  ): Promise<void> {
+    await this.updateSyncState(source, {
+      cursor,
+      stats,
     });
   }
 
   async completeSync(
     source: 'notion' | 'slack',
     lastSyncTimestamp: string,
-    totalDocuments: number
+    totalDocuments: number,
+    stats?: SyncStats
   ): Promise<void> {
     const docRef = this.db.collection(COLLECTION_SYNC_STATE).doc(source);
     await docRef.update({
       status: 'completed',
       lastSyncTimestamp,
       totalDocuments,
+      cursor: FieldValue.delete(),
+      syncStartTime: FieldValue.delete(),
+      stopRequested: FieldValue.delete(),
+      stats: stats || FieldValue.delete(),
       lastError: FieldValue.delete(),
     });
   }
@@ -65,6 +85,22 @@ export class FirestoreService {
     await this.updateSyncState(source, {
       status: 'failed',
       lastError: error,
+      // Keep cursor so we can resume after fixing the issue
+    });
+  }
+
+  async requestStop(source: 'notion' | 'slack'): Promise<void> {
+    await this.updateSyncState(source, { stopRequested: true });
+  }
+
+  async resetSync(source: 'notion' | 'slack'): Promise<void> {
+    await this.updateSyncState(source, {
+      status: 'idle',
+      cursor: null,
+      syncStartTime: null,
+      stopRequested: false,
+      stats: undefined,
+      lastError: undefined,
     });
   }
 
@@ -127,18 +163,67 @@ export class FirestoreService {
       .collection(COLLECTION_DOCUMENTS)
       .where('sourceType', '==', source)
       .get();
-    
+
     return snapshot.docs.map(doc => doc.data() as KnowledgeDocument);
+  }
+
+  /**
+   * Get documents that weren't seen in the current sync run (for delete detection)
+   */
+  async getStaleDocuments(source: 'notion' | 'slack', olderThan: string): Promise<KnowledgeDocument[]> {
+    const snapshot = await this.db
+      .collection(COLLECTION_DOCUMENTS)
+      .where('sourceType', '==', source)
+      .where('lastSeenAt', '<', olderThan)
+      .get();
+
+    return snapshot.docs.map(doc => doc.data() as KnowledgeDocument);
+  }
+
+  /**
+   * Get documents that have never been seen (no lastSeenAt field) - for migration
+   */
+  async getDocumentsWithoutLastSeen(source: 'notion' | 'slack'): Promise<KnowledgeDocument[]> {
+    // Firestore doesn't support "where field doesn't exist" directly,
+    // so we get all docs and filter
+    const allDocs = await this.getDocumentsBySource(source);
+    return allDocs.filter(doc => !doc.lastSeenAt);
+  }
+
+  /**
+   * Mark a document as seen in the current sync
+   */
+  async markDocumentSeen(source: 'notion' | 'slack', sourceId: string): Promise<void> {
+    const docId = this.getDocumentId(source, sourceId);
+    await this.db.collection(COLLECTION_DOCUMENTS).doc(docId).update({
+      lastSeenAt: new Date().toISOString(),
+    });
+  }
+
+  /**
+   * Update document with new data and mark as seen
+   */
+  async updateDocument(
+    source: 'notion' | 'slack',
+    sourceId: string,
+    updates: Partial<KnowledgeDocument>
+  ): Promise<void> {
+    const docId = this.getDocumentId(source, sourceId);
+    await this.db.collection(COLLECTION_DOCUMENTS).doc(docId).update({
+      ...updates,
+      lastSeenAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
   }
 
   async getDocumentCount(source?: 'notion' | 'slack'): Promise<number> {
     let query = this.db.collection(COLLECTION_DOCUMENTS);
-    
+
     if (source) {
       const snapshot = await query.where('sourceType', '==', source).count().get();
       return snapshot.data().count;
     }
-    
+
     const snapshot = await query.count().get();
     return snapshot.data().count;
   }

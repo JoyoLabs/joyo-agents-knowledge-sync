@@ -143,6 +143,28 @@ export class VectorStoreProcessor {
     );
   }
 
+  // ═══════════════════════════════════════════════════════════════════════════
+  // PUBLIC SINGLE FILE METHODS (for streaming sync)
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Upload a single file to OpenAI vector store
+   */
+  async uploadSingleFile(content: string, filename: string): Promise<string> {
+    return this.uploadFile(content, filename);
+  }
+
+  /**
+   * Delete a single file from OpenAI vector store
+   */
+  async deleteSingleFile(fileId: string): Promise<void> {
+    return this.deleteFile(fileId);
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // CONTENT FORMATTERS
+  // ═══════════════════════════════════════════════════════════════════════════
+
   /**
    * Format content for Notion pages
    */

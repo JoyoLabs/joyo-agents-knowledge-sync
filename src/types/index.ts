@@ -6,6 +6,21 @@ export interface SyncState {
   totalDocuments: number;
   lastError?: string;
   lastRunAt?: string;
+
+  // Streaming sync support
+  cursor?: string | null;           // Notion API cursor for resuming
+  syncStartTime?: string | null;    // When this sync run started (for delete detection)
+  stopRequested?: boolean;          // Kill switch
+  stats?: SyncStats;
+}
+
+export interface SyncStats {
+  processed: number;
+  added: number;
+  updated: number;
+  unchanged: number;
+  deleted: number;
+  errored: number;
 }
 
 export interface KnowledgeDocument {
@@ -18,6 +33,7 @@ export interface KnowledgeDocument {
   contentHash: string;
   createdAt: string;
   updatedAt: string;
+  lastSeenAt?: string;  // When this doc was last confirmed to exist in source
 }
 
 // Notion types

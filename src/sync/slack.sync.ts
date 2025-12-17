@@ -103,11 +103,11 @@ export class SlackSync {
     console.log('=== Slack Sync Started ===');
 
     try {
-      await this.firestore.startSync('slack');
-
-      // Get last sync timestamp
+      // Get last sync timestamp first (before starting new sync)
       const syncState = await this.firestore.getSyncState('slack');
       const lastSyncTimestamp = syncState?.lastSyncTimestamp || null;
+
+      await this.firestore.startSync('slack', new Date().toISOString());
       console.log(`Last sync timestamp: ${lastSyncTimestamp || 'none (first sync)'}`);
 
       // Phase 1: Get all public channels

@@ -104,3 +104,62 @@ functions.http('getSyncStatus', async (req: Request, res: Response) => {
     });
   }
 });
+
+// ═══════════════════════════════════════════════════════════════════════════
+// NOTION SYNC CONTROL ENDPOINTS
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Stop a running Notion sync gracefully
+ * The sync will stop after completing the current chunk (~30 seconds max)
+ */
+functions.http('stopNotionSync', async (req: Request, res: Response) => {
+  try {
+    const firestore = new FirestoreService();
+    const state = await firestore.getSyncState('notion');
+
+    if (state?.status !== 'running') {
+      res.status(400).json({
+        success: false,
+        message: 'No Notion sync is currently running',
+        currentStatus: state?.status || 'unknown',
+      });
+      return;
+    }
+
+    await firestore.requestStop('notion');
+
+    res.status(200).json({
+      success: true,
+      message: 'Stop requested. Sync will stop after current chunk completes (max ~30 seconds).',
+    });
+  } catch (error) {
+    console.error('Failed to stop Notion sync:', error);
+    res.status(500).json({
+      success: false,
+      error: error instanceof Error ? error.message : 'Unknown error',
+    });
+  }
+});
+
+/**
+ * Reset Notion sync state (use when sync is stuck)
+ * This clears all progress and allows a fresh start
+ */
+functions.http('resetNotionSync', async (req: Request, res: Response) => {
+  try {
+    const firestore = new FirestoreService();
+    await firestore.resetSync('notion');
+
+    res.status(200).json({
+      success: true,
+      message: 'Notion sync state reset. Next sync will start fresh.',
+    });
+  } catch (error) {
+    console.error('Failed to reset Notion sync:', error);
+    res.status(500).json({
+      success: false,
+      error: error instanceof Error ? error.message : 'Unknown error',
+    });
+  }
+});

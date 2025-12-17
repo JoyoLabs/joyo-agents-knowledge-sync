@@ -4,7 +4,7 @@ set -e
 PROJECT="slack-agent-hub"
 REGION="us-central1"
 RUNTIME="nodejs20"
-MEMORY="512MB"
+MEMORY="4Gi"
 TIMEOUT="3600s"
 
 # Colors for output
@@ -28,6 +28,7 @@ gcloud functions deploy syncNotion \
   --allow-unauthenticated \
   --memory=$MEMORY \
   --timeout=$TIMEOUT \
+  --max-instances=1 \
   --project=$PROJECT \
   --set-secrets="OPENAI_API_KEY=OPENAI_API_KEY:latest,OPENAI_VECTOR_STORE_ID=OPENAI_VECTOR_STORE_ID:latest,NOTION_API_KEY=NOTION_API_KEY:latest,SLACK_BOT_TOKEN=SLACK_BOT_TOKEN:latest" \
   --quiet &
@@ -42,6 +43,7 @@ gcloud functions deploy syncSlack \
   --allow-unauthenticated \
   --memory=$MEMORY \
   --timeout=$TIMEOUT \
+  --max-instances=1 \
   --project=$PROJECT \
   --set-secrets="OPENAI_API_KEY=OPENAI_API_KEY:latest,OPENAI_VECTOR_STORE_ID=OPENAI_VECTOR_STORE_ID:latest,NOTION_API_KEY=NOTION_API_KEY:latest,SLACK_BOT_TOKEN=SLACK_BOT_TOKEN:latest" \
   --quiet &
@@ -60,6 +62,34 @@ gcloud functions deploy getSyncStatus \
   --set-secrets="OPENAI_API_KEY=OPENAI_API_KEY:latest,OPENAI_VECTOR_STORE_ID=OPENAI_VECTOR_STORE_ID:latest,NOTION_API_KEY=NOTION_API_KEY:latest,SLACK_BOT_TOKEN=SLACK_BOT_TOKEN:latest" \
   --quiet &
 
+gcloud functions deploy stopNotionSync \
+  --gen2 \
+  --runtime=$RUNTIME \
+  --region=$REGION \
+  --source=. \
+  --entry-point=stopNotionSync \
+  --trigger-http \
+  --allow-unauthenticated \
+  --memory=256MB \
+  --timeout=60s \
+  --project=$PROJECT \
+  --set-secrets="OPENAI_API_KEY=OPENAI_API_KEY:latest,OPENAI_VECTOR_STORE_ID=OPENAI_VECTOR_STORE_ID:latest,NOTION_API_KEY=NOTION_API_KEY:latest,SLACK_BOT_TOKEN=SLACK_BOT_TOKEN:latest" \
+  --quiet &
+
+gcloud functions deploy resetNotionSync \
+  --gen2 \
+  --runtime=$RUNTIME \
+  --region=$REGION \
+  --source=. \
+  --entry-point=resetNotionSync \
+  --trigger-http \
+  --allow-unauthenticated \
+  --memory=256MB \
+  --timeout=60s \
+  --project=$PROJECT \
+  --set-secrets="OPENAI_API_KEY=OPENAI_API_KEY:latest,OPENAI_VECTOR_STORE_ID=OPENAI_VECTOR_STORE_ID:latest,NOTION_API_KEY=NOTION_API_KEY:latest,SLACK_BOT_TOKEN=SLACK_BOT_TOKEN:latest" \
+  --quiet &
+
 # Wait for all deployments to complete
 wait
 
@@ -69,3 +99,7 @@ echo "Endpoints:"
 echo "  https://$REGION-$PROJECT.cloudfunctions.net/syncNotion"
 echo "  https://$REGION-$PROJECT.cloudfunctions.net/syncSlack"
 echo "  https://$REGION-$PROJECT.cloudfunctions.net/getSyncStatus"
+echo ""
+echo "Control endpoints:"
+echo "  https://$REGION-$PROJECT.cloudfunctions.net/stopNotionSync"
+echo "  https://$REGION-$PROJECT.cloudfunctions.net/resetNotionSync"

@@ -7,21 +7,24 @@ import {
 } from '@notionhq/client/build/src/api-endpoints';
 import {
   NotionPageMeta,
-  NotionPage,
-  SyncDiff,
   SyncResult,
-  VectorStoreOperation,
+  SyncStats,
   KnowledgeDocument,
 } from '../types';
 import { FirestoreService } from '../services/firestore.service';
 import { VectorStoreProcessor } from '../processors/vectorStore.processor';
 import { RateLimiter, calculateContentHash, withRetry, isRateLimitError } from '../utils';
 
+// Configuration
+const CHUNK_SIZE = 20;                    // Pages per Notion API call
+const MAX_RUNTIME_MS = 55 * 60 * 1000;    // 55 minutes (leave buffer before 60 min timeout)
+
 export class NotionSync {
   private notion: Client;
   private firestore: FirestoreService;
   private processor: VectorStoreProcessor;
   private rateLimiter: RateLimiter;
+  private startTime: number = 0;
 
   constructor(
     notionApiKey: string,
@@ -31,15 +34,16 @@ export class NotionSync {
     this.notion = new Client({ auth: notionApiKey });
     this.firestore = new FirestoreService();
     this.processor = new VectorStoreProcessor(openaiApiKey, vectorStoreId, this.firestore);
-    // Notion rate limit: 3 requests per second
-    this.rateLimiter = new RateLimiter(3, 350);
+    this.rateLimiter = new RateLimiter(3, 350); // Notion: 3 req/sec
   }
 
-  /**
-   * Main sync entry point
-   */
+  // ═══════════════════════════════════════════════════════════════════════════
+  // MAIN SYNC METHOD
+  // ═══════════════════════════════════════════════════════════════════════════
+
   async sync(): Promise<SyncResult> {
-    const startTime = Date.now();
+    this.startTime = Date.now();
+
     const result: SyncResult = {
       source: 'notion',
       discovered: { total: 0, toAdd: 0, toUpdate: 0, toDelete: 0, unchanged: 0 },
@@ -48,287 +52,380 @@ export class NotionSync {
       durationMs: 0,
     };
 
-    console.log('=== Notion Sync Started ===');
-
     try {
-      await this.firestore.startSync('notion');
-
-      // Phase 1: Discover all pages from Notion
-      console.log('\n[Phase 1] Discovering pages from Notion...');
-      const allPages = await this.discoverAllPages();
-      console.log(`Discovered ${allPages.length} pages from Notion`);
-
-      // Phase 2: Diff against Firestore
-      console.log('\n[Phase 2] Computing diff against Firestore...');
-      const diff = await this.computeDiff(allPages);
-      result.discovered = {
-        total: allPages.length,
-        toAdd: diff.toAdd.length,
-        toUpdate: diff.toUpdate.length,
-        toDelete: diff.toDelete.length,
-        unchanged: diff.unchanged,
-      };
-      console.log(`Diff: +${diff.toAdd.length} add, ~${diff.toUpdate.length} update, -${diff.toDelete.length} delete, =${diff.unchanged} unchanged`);
-
-      // Phase 3: Fetch content for changed pages
-      console.log('\n[Phase 3] Fetching content for changed pages...');
-      const pagesToProcess = [...diff.toAdd, ...diff.toUpdate];
-      const pagesWithContent = await this.fetchContentForPages(pagesToProcess);
-      console.log(`Fetched content for ${pagesWithContent.length} pages`);
-
-      // Phase 4: Build and process queue
-      console.log('\n[Phase 4] Processing vector store operations...');
-      const operations = await this.buildOperations(pagesWithContent, diff);
-      console.log(`Queued ${operations.length} operations`);
-
-      if (operations.length > 0) {
-        const queueResults = await this.processor.processQueue(operations);
-
-        // Tally results
-        for (const qr of queueResults) {
-          if (qr.success) {
-            if (qr.operation.type === 'delete') {
-              result.processed.deleted++;
-            } else {
-              // It's an upload operation
-              const op = qr.operation as { type: 'upload'; id: string };
-              const isNew = diff.toAdd.some(p => p.id === op.id);
-              if (isNew) {
-                result.processed.added++;
-              } else {
-                result.processed.updated++;
-              }
-            }
-          } else {
-            result.processed.errored++;
-            result.errors.push(qr.error || 'Unknown error');
-          }
-        }
+      // ─────────────────────────────────────────────────────────────────────
+      // 1. INITIALIZE (resume or fresh start)
+      // ─────────────────────────────────────────────────────────────────────
+      const state = await this.initialize();
+      console.log(`=== Notion Sync ${state.isResume ? 'RESUMING' : 'STARTING'} ===`);
+      if (state.isResume) {
+        console.log(`  Resuming from cursor, ${state.stats.processed} pages already done`);
       }
 
-      // Update sync state
-      const latestTimestamp = allPages.length > 0
-        ? allPages.reduce((max, p) => p.lastEditedTime > max ? p.lastEditedTime : max, allPages[0].lastEditedTime)
-        : new Date().toISOString();
+      // ─────────────────────────────────────────────────────────────────────
+      // 2. PROCESS CHUNKS (main streaming loop)
+      // ─────────────────────────────────────────────────────────────────────
+      let hasMore = true;
 
+      while (hasMore) {
+        // Check if we should stop
+        const stopReason = await this.shouldStop();
+        if (stopReason) {
+          console.log(`\n⏸️  Stopping: ${stopReason}`);
+          await this.firestore.saveCheckpoint('notion', state.cursor, state.stats);
+          result.processed = {
+            added: state.stats.added,
+            updated: state.stats.updated,
+            deleted: state.stats.deleted,
+            errored: state.stats.errored,
+          };
+          result.durationMs = Date.now() - this.startTime;
+          result.errors.push(`Sync paused: ${stopReason}`);
+          return result;
+        }
+
+        // Fetch and process one chunk
+        const chunkResult = await this.processChunk(state);
+        hasMore = chunkResult.hasMore;
+        state.cursor = chunkResult.nextCursor;
+
+        // Save checkpoint (safe to kill after this)
+        await this.firestore.saveCheckpoint('notion', state.cursor, state.stats);
+        console.log(`  ✓ Checkpoint: ${state.stats.processed} pages processed`);
+      }
+
+      // ─────────────────────────────────────────────────────────────────────
+      // 3. DELETE STALE DOCUMENTS
+      // ─────────────────────────────────────────────────────────────────────
+      console.log('\n[Delete Phase] Finding stale documents...');
+      const deleteCount = await this.deleteStaleDocuments(state.syncStartTime);
+      state.stats.deleted = deleteCount;
+      console.log(`  Deleted ${deleteCount} stale documents`);
+
+      // ─────────────────────────────────────────────────────────────────────
+      // 4. COMPLETE
+      // ─────────────────────────────────────────────────────────────────────
       const totalDocs = await this.firestore.getDocumentCount('notion');
-      await this.firestore.completeSync('notion', latestTimestamp, totalDocs);
+      await this.firestore.completeSync(
+        'notion',
+        new Date().toISOString(),
+        totalDocs,
+        state.stats
+      );
+
+      result.discovered.total = state.stats.processed;
+      result.discovered.toAdd = state.stats.added;
+      result.discovered.toUpdate = state.stats.updated;
+      result.discovered.toDelete = state.stats.deleted;
+      result.discovered.unchanged = state.stats.unchanged;
+      result.processed = {
+        added: state.stats.added,
+        updated: state.stats.updated,
+        deleted: state.stats.deleted,
+        errored: state.stats.errored,
+      };
 
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error);
       result.errors.push(errorMsg);
       await this.firestore.failSync('notion', errorMsg);
-      console.error('Notion sync failed:', error);
+      console.error('❌ Notion sync failed:', error);
     }
 
-    result.durationMs = Date.now() - startTime;
+    result.durationMs = Date.now() - this.startTime;
     console.log(`\n=== Notion Sync Completed in ${(result.durationMs / 1000).toFixed(1)}s ===`);
-    console.log(`Results: +${result.processed.added} -${result.processed.deleted} ~${result.processed.updated} !${result.processed.errored}`);
+    console.log(`Results: +${result.processed.added} ~${result.processed.updated} -${result.processed.deleted} !${result.processed.errored}`);
 
     return result;
   }
 
-  /**
-   * Phase 1: Discover all page metadata from Notion (fast)
-   * Only includes workspace and page_id parents (actual pages, not database rows)
-   */
-  private async discoverAllPages(): Promise<NotionPageMeta[]> {
-    const pages: NotionPageMeta[] = [];
-    let hasMore = true;
-    let startCursor: string | undefined;
-    let batchNum = 0;
-    let skippedDbRows = 0;
+  // ═══════════════════════════════════════════════════════════════════════════
+  // INITIALIZATION
+  // ═══════════════════════════════════════════════════════════════════════════
 
-    while (hasMore) {
-      batchNum++;
-      const response = await this.rateLimiter.execute(() =>
-        withRetry(
-          () => this.notion.search({
-            filter: { property: 'object', value: 'page' },
-            sort: { direction: 'descending', timestamp: 'last_edited_time' },
-            page_size: 100,
-            start_cursor: startCursor,
-          }),
-          { maxRetries: 3, retryOn: isRateLimitError }
-        )
-      );
+  private async initialize(): Promise<{
+    cursor: string | null;
+    syncStartTime: string;
+    stats: SyncStats;
+    isResume: boolean;
+  }> {
+    const saved = await this.firestore.getSyncState('notion');
 
-      for (const result of response.results) {
-        if (result.object !== 'page') continue;
-        const page = result as PageObjectResponse;
-
-        // Only include actual pages, not database rows
-        // - workspace: top-level pages
-        // - page_id: nested pages under other pages
-        // - block_id: inline pages embedded in blocks
-        // Exclude:
-        // - database_id: rows in databases (often automated entries, may contain sensitive data)
-        const parentType = page.parent.type;
-        if (parentType === 'database_id') {
-          skippedDbRows++;
-          continue;
-        }
-
-        pages.push({
-          id: page.id,
-          title: this.getPageTitle(page),
-          url: page.url,
-          lastEditedTime: page.last_edited_time,
-        });
-      }
-
-      console.log(`  Batch ${batchNum}: ${response.results.length} results, ${pages.length} pages kept, ${skippedDbRows} db rows skipped`);
-      hasMore = response.has_more;
-      startCursor = response.next_cursor || undefined;
+    // Resume from checkpoint?
+    if (saved?.status === 'running' && saved.cursor && saved.syncStartTime) {
+      return {
+        cursor: saved.cursor,
+        syncStartTime: saved.syncStartTime,
+        stats: saved.stats || { processed: 0, added: 0, updated: 0, unchanged: 0, deleted: 0, errored: 0 },
+        isResume: true,
+      };
     }
 
-    console.log(`  Total: ${pages.length} pages (skipped ${skippedDbRows} database rows)`);
+    // Fresh start
+    const syncStartTime = new Date().toISOString();
+    await this.firestore.startSync('notion', syncStartTime);
+
+    return {
+      cursor: null,
+      syncStartTime,
+      stats: { processed: 0, added: 0, updated: 0, unchanged: 0, deleted: 0, errored: 0 },
+      isResume: false,
+    };
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // SHOULD STOP CHECK
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  private async shouldStop(): Promise<string | null> {
+    // Check kill switch
+    const state = await this.firestore.getSyncState('notion');
+    if (state?.stopRequested) {
+      return 'Stop requested by user';
+    }
+
+    // Check timeout
+    const elapsed = Date.now() - this.startTime;
+    if (elapsed > MAX_RUNTIME_MS) {
+      return 'Approaching timeout, will resume next run';
+    }
+
+    return null;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // PROCESS ONE CHUNK
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  private async processChunk(state: {
+    cursor: string | null;
+    syncStartTime: string;
+    stats: SyncStats;
+  }): Promise<{ hasMore: boolean; nextCursor: string | null }> {
+
+    // Fetch chunk from Notion
+    const response = await this.fetchNotionChunk(state.cursor);
+    const pages = this.filterPages(response.results);
+
+    console.log(`\n[Chunk] Fetched ${pages.length} pages (cursor: ${state.cursor ? 'yes' : 'start'})`);
+
+    // Process each page
+    for (const page of pages) {
+      try {
+        await this.processPage(page, state);
+      } catch (error) {
+        console.error(`  ❌ Failed to process page ${page.id}:`, error);
+        state.stats.errored++;
+      }
+      state.stats.processed++;
+    }
+
+    return {
+      hasMore: response.has_more,
+      nextCursor: response.next_cursor || null,
+    };
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // PROCESS SINGLE PAGE
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  private async processPage(
+    page: NotionPageMeta,
+    state: { syncStartTime: string; stats: SyncStats }
+  ): Promise<void> {
+    const existing = await this.firestore.getDocument('notion', page.id);
+
+    if (!existing) {
+      // NEW PAGE
+      await this.syncNewPage(page, state.syncStartTime);
+      state.stats.added++;
+      console.log(`  + Added: ${page.title.substring(0, 50)}`);
+
+    } else if (!existing.vectorStoreFileId) {
+      // INCOMPLETE (crashed during previous upload)
+      await this.syncNewPage(page, state.syncStartTime);
+      state.stats.added++;
+      console.log(`  + Recovered: ${page.title.substring(0, 50)}`);
+
+    } else if (page.lastEditedTime > existing.lastModified) {
+      // UPDATED PAGE
+      await this.syncUpdatedPage(page, existing, state.syncStartTime);
+      state.stats.updated++;
+      console.log(`  ~ Updated: ${page.title.substring(0, 50)}`);
+
+    } else {
+      // UNCHANGED - just mark as seen
+      await this.firestore.markDocumentSeen('notion', page.id);
+      state.stats.unchanged++;
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // SYNC NEW PAGE
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  private async syncNewPage(page: NotionPageMeta, syncStartTime: string): Promise<void> {
+    // Fetch content
+    const content = await this.getPageContent(page.id);
+    const contentHash = calculateContentHash(content);
+
+    // Format for vector store
+    const formattedContent = VectorStoreProcessor.formatNotionContent({
+      url: page.url,
+      title: page.title,
+      content,
+    });
+
+    // Create document in Firestore first (without fileId)
+    const doc: KnowledgeDocument = {
+      sourceType: 'notion',
+      sourceId: page.id,
+      vectorStoreFileId: '',
+      title: page.title,
+      url: page.url,
+      lastModified: page.lastEditedTime,
+      contentHash,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      lastSeenAt: syncStartTime,
+    };
+    await this.firestore.saveDocument(doc);
+
+    // Upload to OpenAI
+    const fileId = await this.processor.uploadSingleFile(formattedContent, `notion_${page.id}.txt`);
+
+    // Update with fileId
+    await this.firestore.updateDocument('notion', page.id, { vectorStoreFileId: fileId });
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // SYNC UPDATED PAGE
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  private async syncUpdatedPage(
+    page: NotionPageMeta,
+    existing: KnowledgeDocument,
+    syncStartTime: string
+  ): Promise<void> {
+    // Fetch new content
+    const content = await this.getPageContent(page.id);
+    const contentHash = calculateContentHash(content);
+
+    // Check if content actually changed
+    if (contentHash === existing.contentHash) {
+      // Only metadata changed, just update timestamp
+      await this.firestore.updateDocument('notion', page.id, {
+        lastModified: page.lastEditedTime,
+        lastSeenAt: syncStartTime,
+      });
+      return;
+    }
+
+    // Content changed - delete old file, upload new
+    if (existing.vectorStoreFileId) {
+      await this.processor.deleteSingleFile(existing.vectorStoreFileId);
+    }
+
+    const formattedContent = VectorStoreProcessor.formatNotionContent({
+      url: page.url,
+      title: page.title,
+      content,
+    });
+
+    const fileId = await this.processor.uploadSingleFile(formattedContent, `notion_${page.id}.txt`);
+
+    await this.firestore.updateDocument('notion', page.id, {
+      vectorStoreFileId: fileId,
+      title: page.title,
+      lastModified: page.lastEditedTime,
+      contentHash,
+      lastSeenAt: syncStartTime,
+    });
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // DELETE STALE DOCUMENTS
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  private async deleteStaleDocuments(syncStartTime: string): Promise<number> {
+    // Get documents not seen in this sync run
+    const staleDocs = await this.firestore.getStaleDocuments('notion', syncStartTime);
+
+    // Also get documents without lastSeenAt (legacy docs before this feature)
+    const legacyDocs = await this.firestore.getDocumentsWithoutLastSeen('notion');
+
+    // Only delete staleDocs (legacy docs will get lastSeenAt on next sync)
+    let deleted = 0;
+    for (const doc of staleDocs) {
+      try {
+        if (doc.vectorStoreFileId) {
+          await this.processor.deleteSingleFile(doc.vectorStoreFileId);
+        }
+        await this.firestore.deleteDocumentBySource('notion', doc.sourceId);
+        deleted++;
+        console.log(`  - Deleted stale: ${doc.title?.substring(0, 50) || doc.sourceId}`);
+      } catch (error) {
+        console.error(`  ❌ Failed to delete ${doc.sourceId}:`, error);
+      }
+    }
+
+    if (legacyDocs.length > 0) {
+      console.log(`  ℹ️  ${legacyDocs.length} legacy docs without lastSeenAt (will be updated on next sync)`);
+    }
+
+    return deleted;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // NOTION API HELPERS
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  private async fetchNotionChunk(cursor: string | null): Promise<{
+    results: PageObjectResponse[];
+    has_more: boolean;
+    next_cursor: string | null;
+  }> {
+    const response = await this.rateLimiter.execute(() =>
+      withRetry(
+        () => this.notion.search({
+          filter: { property: 'object', value: 'page' },
+          sort: { direction: 'descending', timestamp: 'last_edited_time' },
+          page_size: CHUNK_SIZE,
+          start_cursor: cursor || undefined,
+        }),
+        { maxRetries: 3, retryOn: isRateLimitError }
+      )
+    );
+
+    return {
+      results: response.results.filter(r => r.object === 'page') as PageObjectResponse[],
+      has_more: response.has_more,
+      next_cursor: response.next_cursor,
+    };
+  }
+
+  private filterPages(results: PageObjectResponse[]): NotionPageMeta[] {
+    const pages: NotionPageMeta[] = [];
+
+    for (const page of results) {
+      // Only include actual pages, not database rows
+      const parentType = page.parent.type;
+      if (parentType === 'database_id') {
+        continue; // Skip database rows
+      }
+
+      pages.push({
+        id: page.id,
+        title: this.getPageTitle(page),
+        url: page.url,
+        lastEditedTime: page.last_edited_time,
+      });
+    }
+
     return pages;
   }
 
-  /**
-   * Phase 2: Compute diff between Notion pages and Firestore
-   */
-  private async computeDiff(notionPages: NotionPageMeta[]): Promise<SyncDiff<NotionPageMeta>> {
-    const firestoreDocs = await this.firestore.getDocumentIdMap('notion');
-    const notionIds = new Set(notionPages.map(p => p.id));
-
-    const toAdd: NotionPageMeta[] = [];
-    const toUpdate: NotionPageMeta[] = [];
-    let unchanged = 0;
-
-    for (const page of notionPages) {
-      const existing = firestoreDocs.get(page.id);
-      if (!existing) {
-        toAdd.push(page);
-      } else if (page.lastEditedTime > existing.lastModified) {
-        toUpdate.push(page);
-      } else {
-        unchanged++;
-      }
-    }
-
-    // Find deleted pages (in Firestore but not in Notion)
-    const toDelete: string[] = [];
-    for (const [sourceId, doc] of firestoreDocs) {
-      if (!notionIds.has(sourceId)) {
-        toDelete.push(doc.vectorStoreFileId);
-      }
-    }
-
-    return { toAdd, toUpdate, toDelete, unchanged };
-  }
-
-  /**
-   * Phase 3: Fetch content for pages that need processing
-   * Uses concurrent fetching to maximize throughput within rate limits
-   */
-  private async fetchContentForPages(pages: NotionPageMeta[]): Promise<NotionPage[]> {
-    const pagesWithContent: NotionPage[] = [];
-    const concurrency = 3; // Match Notion's rate limit
-    let completed = 0;
-
-    // Process pages with controlled concurrency
-    const fetchPage = async (page: NotionPageMeta): Promise<NotionPage> => {
-      try {
-        const content = await this.getPageContent(page.id);
-        return { ...page, content };
-      } catch (error) {
-        console.error(`  Failed to fetch content for ${page.id}: ${error}`);
-        return { ...page, content: `Title: ${page.title}` };
-      }
-    };
-
-    // Process in concurrent batches
-    for (let i = 0; i < pages.length; i += concurrency) {
-      const batch = pages.slice(i, i + concurrency);
-      const results = await Promise.all(batch.map(fetchPage));
-      pagesWithContent.push(...results);
-
-      completed += batch.length;
-      if (completed % 10 === 0 || completed === pages.length) {
-        console.log(`  Fetched content: ${completed}/${pages.length}`);
-      }
-    }
-
-    return pagesWithContent;
-  }
-
-  /**
-   * Phase 4: Build vector store operations
-   */
-  private async buildOperations(
-    pages: NotionPage[],
-    diff: SyncDiff<NotionPageMeta>
-  ): Promise<VectorStoreOperation[]> {
-    const operations: VectorStoreOperation[] = [];
-    const firestoreDocs = await this.firestore.getDocumentIdMap('notion');
-
-    // Delete operations for removed pages
-    for (const [sourceId, doc] of firestoreDocs) {
-      if (diff.toDelete.includes(doc.vectorStoreFileId)) {
-        operations.push({
-          type: 'delete',
-          fileId: doc.vectorStoreFileId,
-          docId: this.firestore.getDocumentId('notion', sourceId),
-        });
-      }
-    }
-
-    // Upload operations for new/updated pages
-    for (const page of pages) {
-      const contentHash = calculateContentHash(page.content);
-      const existing = firestoreDocs.get(page.id);
-
-      // For updates, check if content actually changed
-      if (existing && existing.contentHash === contentHash) {
-        continue; // Content hasn't changed, skip
-      }
-
-      const formattedContent = VectorStoreProcessor.formatNotionContent({
-        url: page.url,
-        title: page.title,
-        content: page.content,
-      });
-
-      // If updating, delete old file first
-      if (existing) {
-        operations.push({
-          type: 'delete',
-          fileId: existing.vectorStoreFileId,
-          docId: this.firestore.getDocumentId('notion', page.id),
-        });
-      }
-
-      // Create new document in Firestore first (without fileId)
-      const newDoc: KnowledgeDocument = {
-        sourceType: 'notion',
-        sourceId: page.id,
-        vectorStoreFileId: '', // Will be updated after upload
-        title: page.title,
-        url: page.url,
-        lastModified: page.lastEditedTime,
-        contentHash,
-        createdAt: existing?.createdAt || new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-      };
-      await this.firestore.saveDocument(newDoc);
-
-      operations.push({
-        type: 'upload',
-        id: page.id,
-        content: formattedContent,
-        filename: `notion_${page.id}.txt`,
-        source: 'notion',
-      });
-    }
-
-    return operations;
-  }
-
-  /**
-   * Get page title from properties
-   */
   private getPageTitle(page: PageObjectResponse): string {
     const properties = page.properties;
 
@@ -348,9 +445,6 @@ export class NotionSync {
     return 'Untitled';
   }
 
-  /**
-   * Get all content from a page's blocks
-   */
   private async getPageContent(pageId: string): Promise<string> {
     const blocks = await this.getAllBlocks(pageId);
     const textParts: string[] = [];
@@ -365,9 +459,6 @@ export class NotionSync {
     return textParts.join('\n\n') || 'No content';
   }
 
-  /**
-   * Fetch all blocks from a page (handles pagination)
-   */
   private async getAllBlocks(blockId: string): Promise<BlockObjectResponse[]> {
     const blocks: BlockObjectResponse[] = [];
     let hasMore = true;
