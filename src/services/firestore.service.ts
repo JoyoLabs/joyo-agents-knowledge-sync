@@ -93,9 +93,33 @@ export class FirestoreService {
     });
   }
 
-  async deleteDocument(source: 'notion' | 'slack', sourceId: string): Promise<void> {
+  async deleteDocument(docId: string): Promise<void> {
+    await this.db.collection(COLLECTION_DOCUMENTS).doc(docId).delete();
+  }
+
+  async deleteDocumentBySource(source: 'notion' | 'slack', sourceId: string): Promise<void> {
     const docId = this.getDocumentId(source, sourceId);
     await this.db.collection(COLLECTION_DOCUMENTS).doc(docId).delete();
+  }
+
+  async updateDocumentFileId(
+    source: 'notion' | 'slack',
+    sourceId: string,
+    vectorStoreFileId: string
+  ): Promise<void> {
+    const docId = this.getDocumentId(source, sourceId);
+    await this.db.collection(COLLECTION_DOCUMENTS).doc(docId).update({
+      vectorStoreFileId,
+      updatedAt: new Date().toISOString(),
+    });
+  }
+
+  /**
+   * Get all document IDs for a source (for diff detection)
+   */
+  async getDocumentIdMap(source: 'notion' | 'slack'): Promise<Map<string, KnowledgeDocument>> {
+    const docs = await this.getDocumentsBySource(source);
+    return new Map(docs.map(d => [d.sourceId, d]));
   }
 
   async getDocumentsBySource(source: 'notion' | 'slack'): Promise<KnowledgeDocument[]> {

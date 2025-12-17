@@ -22,11 +22,14 @@ export interface KnowledgeDocument {
 
 // Notion types
 
-export interface NotionPage {
+export interface NotionPageMeta {
   id: string;
   title: string;
   url: string;
   lastEditedTime: string;
+}
+
+export interface NotionPage extends NotionPageMeta {
   content: string;
 }
 
@@ -55,15 +58,47 @@ export interface SlackChannel {
   name: string;
 }
 
+// Sync diff types
+
+export interface SyncDiff<T> {
+  toAdd: T[];
+  toUpdate: T[];
+  toDelete: string[]; // IDs to delete
+  unchanged: number;
+}
+
+// Vector store queue types
+
+export type VectorStoreOperation =
+  | { type: 'upload'; id: string; content: string; filename: string; source: 'notion' | 'slack' }
+  | { type: 'delete'; fileId: string; docId: string };
+
+export interface QueueResult {
+  operation: VectorStoreOperation;
+  success: boolean;
+  fileId?: string;
+  error?: string;
+}
+
 // Sync results
 
 export interface SyncResult {
   source: 'notion' | 'slack';
-  added: number;
-  updated: number;
-  skipped: number;
-  errored: number;
+  discovered: {
+    total: number;
+    toAdd: number;
+    toUpdate: number;
+    toDelete: number;
+    unchanged: number;
+  };
+  processed: {
+    added: number;
+    updated: number;
+    deleted: number;
+    errored: number;
+  };
   errors: string[];
+  durationMs: number;
 }
 
 // Config
@@ -81,6 +116,3 @@ export interface VectorStoreFile {
   id: string;
   status: 'in_progress' | 'completed' | 'failed' | 'cancelled';
 }
-
-
-

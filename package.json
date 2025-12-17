@@ -5,14 +5,9 @@
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc",
-    "start": "functions-framework --target=syncKnowledgeBase",
+    "start": "functions-framework --target=syncNotion",
     "dev": "tsc -w",
-    "deploy": "npm run build && gcloud functions deploy syncKnowledgeBase --gen2 --runtime=nodejs20 --region=us-central1 --trigger-http --allow-unauthenticated --set-secrets=OPENAI_API_KEY=OPENAI_API_KEY:latest,OPENAI_VECTOR_STORE_ID=OPENAI_VECTOR_STORE_ID:latest,NOTION_API_KEY=NOTION_API_KEY:latest,SLACK_BOT_TOKEN=SLACK_BOT_TOKEN:latest --timeout=540s --memory=1Gi --project=slack-agent-hub",
-    "deploy:all": "npm run build && npm run deploy:syncKnowledgeBase && npm run deploy:syncNotion && npm run deploy:syncSlack && npm run deploy:getSyncStatus",
-    "deploy:syncKnowledgeBase": "gcloud functions deploy syncKnowledgeBase --gen2 --runtime=nodejs20 --region=us-central1 --trigger-http --allow-unauthenticated --set-secrets=OPENAI_API_KEY=OPENAI_API_KEY:latest,OPENAI_VECTOR_STORE_ID=OPENAI_VECTOR_STORE_ID:latest,NOTION_API_KEY=NOTION_API_KEY:latest,SLACK_BOT_TOKEN=SLACK_BOT_TOKEN:latest --timeout=540s --memory=1Gi --project=slack-agent-hub --entry-point=syncKnowledgeBase",
-    "deploy:syncNotion": "gcloud functions deploy syncNotion --gen2 --runtime=nodejs20 --region=us-central1 --trigger-http --allow-unauthenticated --set-secrets=OPENAI_API_KEY=OPENAI_API_KEY:latest,OPENAI_VECTOR_STORE_ID=OPENAI_VECTOR_STORE_ID:latest,NOTION_API_KEY=NOTION_API_KEY:latest --timeout=540s --memory=1Gi --project=slack-agent-hub --entry-point=syncNotion",
-    "deploy:syncSlack": "gcloud functions deploy syncSlack --gen2 --runtime=nodejs20 --region=us-central1 --trigger-http --allow-unauthenticated --set-secrets=OPENAI_API_KEY=OPENAI_API_KEY:latest,OPENAI_VECTOR_STORE_ID=OPENAI_VECTOR_STORE_ID:latest,SLACK_BOT_TOKEN=SLACK_BOT_TOKEN:latest --timeout=540s --memory=1Gi --project=slack-agent-hub --entry-point=syncSlack",
-    "deploy:getSyncStatus": "gcloud functions deploy getSyncStatus --gen2 --runtime=nodejs20 --region=us-central1 --trigger-http --allow-unauthenticated --timeout=60s --memory=256Mi --project=slack-agent-hub --entry-point=getSyncStatus"
+    "deploy": "./scripts/deploy.sh"
   },
   "engines": {
     "node": ">=20.0.0"
@@ -26,9 +21,7 @@
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
+    "dotenv": "^17.2.3",
     "typescript": "^5.0.0"
   }
 }
-
-
-

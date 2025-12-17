@@ -4,25 +4,27 @@ Syncs company knowledge from **Notion** and **Slack** into an **OpenAI Vector St
 
 ## Features
 
-- **Notion Sync**: Fetches all accessible pages, extracts content from blocks, uploads to OpenAI Vector Store
-- **Slack Sync**: Fetches messages from all public channels, includes thread replies, uploads to OpenAI Vector Store
+- **Notion Sync**: Fetches all accessible pages (excludes database rows), extracts content from blocks, uploads to OpenAI Vector Store
+- **Slack Sync**: Fetches meaningful messages from public channels (≥50 chars, no bots), includes thread replies
 - **Incremental Updates**: Uses Firestore to track sync state and content hashes to avoid reprocessing
-- **Scheduled Runs**: Runs every 6 hours via Cloud Scheduler
+- **Parallel Processing**: 10x concurrent uploads to OpenAI, 3x concurrent Notion fetches
+- **Scheduled Runs**: Separate schedulers for Notion and Slack (daily)
 - **Manual Triggers**: HTTP endpoints for on-demand syncing
 
 ## Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                    CLOUD SCHEDULER                              │
-│                    (every 6 hours)                              │
+│                    CLOUD SCHEDULERS                             │
+│   notion-sync-scheduler (daily at 00:00 UTC)                    │
+│   slack-sync-scheduler  (daily at 00:30 UTC)                    │
 └─────────────────────┬───────────────────────────────────────────┘
-                      │ HTTP trigger
+                      │ HTTP triggers
                       ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│              CLOUD FUNCTION: syncKnowledgeBase                  │
+│  CLOUD FUNCTIONS                                                │
 │  ┌─────────────────┐    ┌─────────────────┐                     │
-│  │  Notion Sync    │    │   Slack Sync    │                     │
+│  │  syncNotion     │    │   syncSlack     │                     │
 │  │  - Search API   │    │   - List chans  │                     │
 │  │  - Get blocks   │    │   - Get history │                     │
 │  │  - Extract text │    │   - Get threads │                     │
@@ -30,8 +32,8 @@ Syncs company knowledge from **Notion** and **Slack** into an **OpenAI Vector St
 │           └──────────┬───────────┘                              │
 │                      ▼                                          │
 │           ┌─────────────────────┐                               │
-│           │  Vector Store Mgr   │                               │
-│           │  - Upload to OpenAI │                               │
+│           │  Vector Store Proc  │                               │
+│           │  - Parallel uploads │                               │
 │           │  - Track in Firestore│                              │
 │           └─────────────────────┘                               │
 └─────────────────────────────────────────────────────────────────┘
@@ -63,7 +65,7 @@ gcloud config set project slack-agent-hub
 
 # Create secrets
 echo -n "your-openai-api-key" | gcloud secrets create OPENAI_API_KEY --data-file=-
-echo -n "vs_6941838e1f288191b75dbd9fd58df80a" | gcloud secrets create OPENAI_VECTOR_STORE_ID --data-file=-
+echo -n "vs_6942f90db9f08191b40a572b42047972" | gcloud secrets create OPENAI_VECTOR_STORE_ID --data-file=-
 echo -n "your-notion-api-key" | gcloud secrets create NOTION_API_KEY --data-file=-
 echo -n "your-slack-bot-token" | gcloud secrets create SLACK_BOT_TOKEN --data-file=-
 ```
@@ -82,39 +84,34 @@ npm run build
 
 ## Deployment
 
-### Deploy All Functions
+### Deploy All Functions (Parallel)
 
 ```bash
-npm run deploy:all
+./scripts/deploy.sh
 ```
 
-### Deploy Individual Functions
+### Create Cloud Schedulers
 
 ```bash
-npm run deploy:syncKnowledgeBase
-npm run deploy:syncNotion
-npm run deploy:syncSlack
-npm run deploy:getSyncStatus
-```
+# Notion sync - daily at midnight UTC
+gcloud scheduler jobs create http notion-sync-scheduler \
+  --schedule="0 0 * * *" \
+  --uri="https://us-central1-slack-agent-hub.cloudfunctions.net/syncNotion" \
+  --http-method=POST --location=us-central1 --project=slack-agent-hub
 
-### Create Cloud Scheduler Job
-
-```bash
-gcloud scheduler jobs create http sync-knowledge-base \
-  --schedule="0 */6 * * *" \
-  --uri="https://us-central1-slack-agent-hub.cloudfunctions.net/syncKnowledgeBase" \
-  --http-method=POST \
-  --location=us-central1 \
-  --project=slack-agent-hub
+# Slack sync - daily at 00:30 UTC
+gcloud scheduler jobs create http slack-sync-scheduler \
+  --schedule="30 0 * * *" \
+  --uri="https://us-central1-slack-agent-hub.cloudfunctions.net/syncSlack" \
+  --http-method=POST --location=us-central1 --project=slack-agent-hub
 ```
 
 ## API Endpoints
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/syncKnowledgeBase` | POST | Full sync of Notion and Slack |
-| `/syncNotion` | POST | Sync only Notion |
-| `/syncSlack` | POST | Sync only Slack |
+| `/syncNotion` | POST | Sync Notion pages |
+| `/syncSlack` | POST | Sync Slack messages |
 | `/getSyncStatus` | GET | Get current sync status |
 
 ## Local Development
@@ -122,11 +119,11 @@ gcloud scheduler jobs create http sync-knowledge-base \
 ### Run Locally with Functions Framework
 
 ```bash
-# Set environment variables
-export OPENAI_API_KEY="your-key"
-export OPENAI_VECTOR_STORE_ID="vs_xxx"
-export NOTION_API_KEY="ntn_xxx"
-export SLACK_BOT_TOKEN="xoxb-xxx"
+# Create .env file with required variables
+OPENAI_API_KEY=your-key
+OPENAI_VECTOR_STORE_ID=vs_6942f90db9f08191b40a572b42047972
+NOTION_API_KEY=ntn_xxx
+SLACK_BOT_TOKEN=xoxb-xxx
 
 # Start the function
 npm start
@@ -150,6 +147,20 @@ Tracks sync state for each source:
 Tracks individual synced documents:
 - Document ID: `{source}_{sourceId}` (e.g., `notion_abc123`, `slack_C123_1702684800`)
 - Fields: `sourceType, sourceId, vectorStoreFileId, title, url, lastModified, contentHash, createdAt, updatedAt`
+
+## Content Filtering
+
+### Notion Pages
+
+Only syncs actual pages, not database rows:
+- **Included**: `workspace` (top-level), `page_id` (nested), `block_id` (inline) parents
+- **Excluded**: `database_id` parents (task trackers, credentials, automated logs)
+
+### Slack Messages
+
+Only syncs meaningful human messages:
+- **Included**: Messages ≥50 chars from public channels, thread replies
+- **Excluded**: Bot messages, system messages, short messages
 
 ## Content Format
 
@@ -178,37 +189,26 @@ Jane: {reply}
 
 ## Monitoring
 
-The service logs:
-- Sync started/completed
-- Documents added/updated/skipped/errored (with counts)
-- API rate limit warnings
-- Vector store file IDs created
-
-View logs in Google Cloud Console:
+View logs:
 ```bash
-gcloud functions logs read syncKnowledgeBase --project=slack-agent-hub
+gcloud functions logs read syncNotion --project=slack-agent-hub
+gcloud functions logs read syncSlack --project=slack-agent-hub
 ```
 
-## Troubleshooting
+Check sync status:
+```bash
+curl https://us-central1-slack-agent-hub.cloudfunctions.net/getSyncStatus
+```
 
-### Rate Limits
+## Rate Limits
 
-- **Notion**: 3 requests/second - handled with rate limiter
-- **Slack**: Tier-based - handled with rate limiter
-- **OpenAI**: Handled with retry logic
-
-### Common Issues
-
-1. **Missing secrets**: Ensure all secrets are created in Secret Manager
-2. **Notion access**: Make sure pages are shared with the integration
-3. **Slack scopes**: Bot needs `channels:read`, `channels:history`, `users:read`
+- **Notion**: 3 requests/second - fetches run with 3x concurrency
+- **Slack**: Tier-based - uses conservative 1 req/500ms
+- **OpenAI**: 10x concurrent uploads with retry logic
 
 ## Consumer
 
 The **MetricDashboard** repo queries this vector store using:
 - OpenAI Assistants API with `file_search` tool
-- Vector Store ID: `vs_6941838e1f288191b75dbd9fd58df80a`
+- Vector Store ID: `vs_6942f90db9f08191b40a572b42047972`
 - Expects source metadata format: `[SOURCE:type|URL:url|TITLE:title]`
-
-
-
