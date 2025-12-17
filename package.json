@@ -1,0 +1,34 @@
+{
+  "name": "joyo-knowledge-sync",
+  "version": "1.0.0",
+  "description": "Syncs company knowledge from Notion and Slack into OpenAI Vector Store for RAG-based chat",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "functions-framework --target=syncKnowledgeBase",
+    "dev": "tsc -w",
+    "deploy": "npm run build && gcloud functions deploy syncKnowledgeBase --gen2 --runtime=nodejs20 --region=us-central1 --trigger-http --allow-unauthenticated --set-secrets=OPENAI_API_KEY=OPENAI_API_KEY:latest,OPENAI_VECTOR_STORE_ID=OPENAI_VECTOR_STORE_ID:latest,NOTION_API_KEY=NOTION_API_KEY:latest,SLACK_BOT_TOKEN=SLACK_BOT_TOKEN:latest --timeout=540s --memory=1Gi --project=slack-agent-hub",
+    "deploy:all": "npm run build && npm run deploy:syncKnowledgeBase && npm run deploy:syncNotion && npm run deploy:syncSlack && npm run deploy:getSyncStatus",
+    "deploy:syncKnowledgeBase": "gcloud functions deploy syncKnowledgeBase --gen2 --runtime=nodejs20 --region=us-central1 --trigger-http --allow-unauthenticated --set-secrets=OPENAI_API_KEY=OPENAI_API_KEY:latest,OPENAI_VECTOR_STORE_ID=OPENAI_VECTOR_STORE_ID:latest,NOTION_API_KEY=NOTION_API_KEY:latest,SLACK_BOT_TOKEN=SLACK_BOT_TOKEN:latest --timeout=540s --memory=1Gi --project=slack-agent-hub --entry-point=syncKnowledgeBase",
+    "deploy:syncNotion": "gcloud functions deploy syncNotion --gen2 --runtime=nodejs20 --region=us-central1 --trigger-http --allow-unauthenticated --set-secrets=OPENAI_API_KEY=OPENAI_API_KEY:latest,OPENAI_VECTOR_STORE_ID=OPENAI_VECTOR_STORE_ID:latest,NOTION_API_KEY=NOTION_API_KEY:latest --timeout=540s --memory=1Gi --project=slack-agent-hub --entry-point=syncNotion",
+    "deploy:syncSlack": "gcloud functions deploy syncSlack --gen2 --runtime=nodejs20 --region=us-central1 --trigger-http --allow-unauthenticated --set-secrets=OPENAI_API_KEY=OPENAI_API_KEY:latest,OPENAI_VECTOR_STORE_ID=OPENAI_VECTOR_STORE_ID:latest,SLACK_BOT_TOKEN=SLACK_BOT_TOKEN:latest --timeout=540s --memory=1Gi --project=slack-agent-hub --entry-point=syncSlack",
+    "deploy:getSyncStatus": "gcloud functions deploy getSyncStatus --gen2 --runtime=nodejs20 --region=us-central1 --trigger-http --allow-unauthenticated --timeout=60s --memory=256Mi --project=slack-agent-hub --entry-point=getSyncStatus"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "@google-cloud/firestore": "^7.0.0",
+    "@google-cloud/functions-framework": "^3.0.0",
+    "@notionhq/client": "^2.2.0",
+    "@slack/web-api": "^7.0.0",
+    "openai": "^4.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0"
+  }
+}
+
+
+
