@@ -32,11 +32,13 @@ curl -X POST https://us-central1-slack-agent-hub.cloudfunctions.net/syncSlack
 # Check sync status
 curl https://us-central1-slack-agent-hub.cloudfunctions.net/getSyncStatus
 
-# Stop a running Notion sync (graceful, ~30s max wait)
+# Stop a running sync (graceful)
 curl -X POST https://us-central1-slack-agent-hub.cloudfunctions.net/stopNotionSync
+curl -X POST https://us-central1-slack-agent-hub.cloudfunctions.net/stopSlackSync
 
-# Reset Notion sync state (if stuck)
+# Reset sync state (if stuck)
 curl -X POST https://us-central1-slack-agent-hub.cloudfunctions.net/resetNotionSync
+curl -X POST https://us-central1-slack-agent-hub.cloudfunctions.net/resetSlackSync
 
 # Cleanup (reset Firestore, optionally delete vector store)
 npx ts-node scripts/cleanup.ts
@@ -114,13 +116,48 @@ The Notion sync uses a **streaming, resumable architecture** to handle large wor
 | `POST /resetNotionSync` | Clear all state, start fresh |
 | `GET /getSyncStatus` | View current progress |
 
-## Slack Sync (3 phases)
+## Slack Sync (Streaming Architecture)
 
-1. **Discover** - Fetch new messages since last sync
-2. **Build Operations** - Create upload queue for new messages
-3. **Process** - Upload to OpenAI Vector Store (10x concurrent)
+The Slack sync uses the same **streaming, resumable architecture** as Notion:
 
-Messages are treated as immutable - no update/delete detection.
+### Flow
+
+```
+1. INITIALIZE
+   └─► Check if resuming (has currentChannelIndex/Cursor?)
+   └─► Get list of all public channels
+   └─► If resuming: skip to saved channel/cursor
+   └─► If fresh: record syncStartTime
+
+2. LOOP: Process channels sequentially
+   └─► For each channel, fetch messages (paginated, 100 at a time)
+   └─► For each message:
+       • NEW? → fetch user, replies, upload to OpenAI, create doc
+       • UPDATED? (edited or new replies) → delete old file, re-upload
+       • UNCHANGED? → just mark lastSeenAt
+   └─► Save checkpoint (channelIndex + cursor + stats)
+   └─► Check kill switch / timeout
+
+3. DELETE STALE
+   └─► Query docs where lastSeenAt < syncStartTime
+   └─► Delete from OpenAI + Firestore
+
+4. COMPLETE
+```
+
+### Change Detection
+- **New messages**: Not in Firestore
+- **Edited messages**: `editedTs` changed
+- **Thread updates**: `replyCount` increased
+
+### Control Endpoints
+
+| Endpoint | Purpose |
+|----------|---------|
+| `POST /syncSlack` | Start or resume sync |
+| `POST /stopSlackSync` | Set stop flag (graceful stop) |
+| `POST /resetSlackSync` | Clear all state, start fresh |
+| `GET /getSyncStatus` | View current progress |
 
 ## Key Design Decisions
 
@@ -192,10 +229,12 @@ Each synced document:
 | Function | Purpose | Timeout |
 |----------|---------|---------|
 | `syncNotion` | Stream sync Notion pages | 60 min |
-| `syncSlack` | Sync Slack messages | 60 min |
+| `syncSlack` | Stream sync Slack messages | 60 min |
 | `getSyncStatus` | Return current state | 60s |
 | `stopNotionSync` | Request graceful stop | 60s |
 | `resetNotionSync` | Reset sync state | 60s |
+| `stopSlackSync` | Request graceful stop | 60s |
+| `resetSlackSync` | Reset sync state | 60s |
 
 ## Deployment
 
@@ -215,6 +254,6 @@ For local dev, create `.env` file (already in .gitignore).
 
 ## Rate Limits
 
-- **Notion**: 3 requests/second - single function with rate limiter
-- **Slack**: Tier-based - uses conservative 1 req/500ms
+- **Notion**: 3 requests/second - smart rate limiter (only delays when needed)
+- **Slack**: Tier 3 (50 req/min) - uses 1 req/1.2s rate limiter
 - **OpenAI**: Retry with exponential backoff

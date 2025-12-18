@@ -90,6 +90,34 @@ gcloud functions deploy resetNotionSync \
   --set-secrets="OPENAI_API_KEY=OPENAI_API_KEY:latest,OPENAI_VECTOR_STORE_ID=OPENAI_VECTOR_STORE_ID:latest,NOTION_API_KEY=NOTION_API_KEY:latest,SLACK_BOT_TOKEN=SLACK_BOT_TOKEN:latest" \
   --quiet &
 
+gcloud functions deploy stopSlackSync \
+  --gen2 \
+  --runtime=$RUNTIME \
+  --region=$REGION \
+  --source=. \
+  --entry-point=stopSlackSync \
+  --trigger-http \
+  --allow-unauthenticated \
+  --memory=256MB \
+  --timeout=60s \
+  --project=$PROJECT \
+  --set-secrets="OPENAI_API_KEY=OPENAI_API_KEY:latest,OPENAI_VECTOR_STORE_ID=OPENAI_VECTOR_STORE_ID:latest,NOTION_API_KEY=NOTION_API_KEY:latest,SLACK_BOT_TOKEN=SLACK_BOT_TOKEN:latest" \
+  --quiet &
+
+gcloud functions deploy resetSlackSync \
+  --gen2 \
+  --runtime=$RUNTIME \
+  --region=$REGION \
+  --source=. \
+  --entry-point=resetSlackSync \
+  --trigger-http \
+  --allow-unauthenticated \
+  --memory=256MB \
+  --timeout=60s \
+  --project=$PROJECT \
+  --set-secrets="OPENAI_API_KEY=OPENAI_API_KEY:latest,OPENAI_VECTOR_STORE_ID=OPENAI_VECTOR_STORE_ID:latest,NOTION_API_KEY=NOTION_API_KEY:latest,SLACK_BOT_TOKEN=SLACK_BOT_TOKEN:latest" \
+  --quiet &
+
 # Wait for all deployments to complete
 wait
 
@@ -103,3 +131,5 @@ echo ""
 echo "Control endpoints:"
 echo "  https://$REGION-$PROJECT.cloudfunctions.net/stopNotionSync"
 echo "  https://$REGION-$PROJECT.cloudfunctions.net/resetNotionSync"
+echo "  https://$REGION-$PROJECT.cloudfunctions.net/stopSlackSync"
+echo "  https://$REGION-$PROJECT.cloudfunctions.net/resetSlackSync"

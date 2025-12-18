@@ -163,3 +163,62 @@ functions.http('resetNotionSync', async (req: Request, res: Response) => {
     });
   }
 });
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SLACK SYNC CONTROL ENDPOINTS
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Stop a running Slack sync gracefully
+ * The sync will stop after completing the current message (~10 seconds max)
+ */
+functions.http('stopSlackSync', async (req: Request, res: Response) => {
+  try {
+    const firestore = new FirestoreService();
+    const state = await firestore.getSyncState('slack');
+
+    if (state?.status !== 'running') {
+      res.status(400).json({
+        success: false,
+        message: 'No Slack sync is currently running',
+        currentStatus: state?.status || 'unknown',
+      });
+      return;
+    }
+
+    await firestore.requestStop('slack');
+
+    res.status(200).json({
+      success: true,
+      message: 'Stop requested. Sync will stop after current message completes.',
+    });
+  } catch (error) {
+    console.error('Failed to stop Slack sync:', error);
+    res.status(500).json({
+      success: false,
+      error: error instanceof Error ? error.message : 'Unknown error',
+    });
+  }
+});
+
+/**
+ * Reset Slack sync state (use when sync is stuck)
+ * This clears all progress and allows a fresh start
+ */
+functions.http('resetSlackSync', async (req: Request, res: Response) => {
+  try {
+    const firestore = new FirestoreService();
+    await firestore.resetSync('slack');
+
+    res.status(200).json({
+      success: true,
+      message: 'Slack sync state reset. Next sync will start fresh.',
+    });
+  } catch (error) {
+    console.error('Failed to reset Slack sync:', error);
+    res.status(500).json({
+      success: false,
+      error: error instanceof Error ? error.message : 'Unknown error',
+    });
+  }
+});
