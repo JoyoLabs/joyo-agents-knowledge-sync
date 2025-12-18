@@ -40,9 +40,17 @@ curl -X POST https://us-central1-slack-agent-hub.cloudfunctions.net/stopSlackSyn
 curl -X POST https://us-central1-slack-agent-hub.cloudfunctions.net/resetNotionSync
 curl -X POST https://us-central1-slack-agent-hub.cloudfunctions.net/resetSlackSync
 
-# Cleanup (reset Firestore, optionally delete vector store)
-npx ts-node scripts/cleanup.ts
-npx ts-node scripts/cleanup.ts --delete-store
+# Full cleanup (reset Firestore + delete all OpenAI files)
+npx ts-node scripts/full-cleanup.ts
+
+# Clean orphaned OpenAI files (not tracked in Firestore)
+npx ts-node scripts/cleanup-openai.ts
+
+# Test Notion sync locally (limited pages)
+npx ts-node scripts/test-streaming.ts
+
+# Test Slack sync locally (limited messages)
+npx ts-node scripts/test-slack-sync.ts
 ```
 
 ## Architecture
@@ -54,11 +62,21 @@ src/
 ├── types/index.ts                  # All TypeScript interfaces
 ├── sync/
 │   ├── notion.sync.ts              # Notion sync (streaming, resumable)
-│   └── slack.sync.ts               # Slack sync (3-phase)
+│   └── slack.sync.ts               # Slack sync (streaming, resumable)
 ├── processors/
 │   └── vectorStore.processor.ts    # OpenAI uploads (single + batch)
 └── services/
     └── firestore.service.ts        # State tracking, checkpoints, change detection
+
+scripts/
+├── deploy.sh                       # Deploy all Cloud Functions
+├── full-cleanup.ts                 # Reset everything (Firestore + OpenAI)
+├── cleanup-openai.ts               # Clean orphaned OpenAI files
+├── test-streaming.ts               # Test Notion sync locally (with maxPages)
+├── test-slack-sync.ts              # Test Slack sync locally (with maxMessages)
+├── test-timing.ts                  # Raw API timing benchmarks
+├── test-detailed-timing.ts         # Full pipeline timing per page
+└── check-page-blocks.ts            # Analyze Notion page block counts
 ```
 
 ## Notion Sync (Streaming Architecture)
@@ -189,7 +207,7 @@ Each `KnowledgeDocument` tracks its own state:
 
 ### Incremental Sync
 - **Notion**: Uses `lastEditedTime` comparison + content hash.
-- **Slack**: Checks if message exists in Firestore.
+- **Slack**: Checks for new messages, edits (`editedTs`), and thread updates (`replyCount`).
 
 ## Firestore Collections
 
@@ -200,10 +218,16 @@ Tracks sync progress per source:
   status: 'idle' | 'running' | 'completed' | 'failed',
   lastSyncTimestamp: string,
   totalDocuments: number,
-  cursor?: string,           // For resuming Notion sync
   syncStartTime?: string,    // For delete detection
   stopRequested?: boolean,   // Kill switch
-  stats?: { processed, added, updated, unchanged, deleted, errored }
+  stats?: { processed, added, updated, unchanged, deleted, errored },
+  
+  // Notion-specific
+  cursor?: string,           // Notion API pagination cursor
+  
+  // Slack-specific
+  currentChannelIndex?: number,    // Which channel we're on
+  currentChannelCursor?: string    // Cursor within channel
 }
 ```
 
@@ -220,7 +244,11 @@ Each synced document:
   contentHash: string,
   lastSeenAt: string,        // For delete detection
   createdAt: string,
-  updatedAt: string
+  updatedAt: string,
+  
+  // Slack-specific (for change detection)
+  replyCount?: number,       // Thread reply count
+  editedTs?: string          // Last edit timestamp
 }
 ```
 
