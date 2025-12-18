@@ -34,14 +34,15 @@ export class NotionSync {
     this.notion = new Client({ auth: notionApiKey });
     this.firestore = new FirestoreService();
     this.processor = new VectorStoreProcessor(openaiApiKey, vectorStoreId, this.firestore);
-    this.rateLimiter = new RateLimiter(3, 350); // Notion: 3 req/sec
+    this.rateLimiter = new RateLimiter(3, 1000); // Notion: 3 requests per 1 second
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
   // MAIN SYNC METHOD
   // ═══════════════════════════════════════════════════════════════════════════
 
-  async sync(): Promise<SyncResult> {
+  async sync(options?: { maxPages?: number }): Promise<SyncResult> {
+    const maxPages = options?.maxPages;
     this.startTime = Date.now();
 
     const result: SyncResult = {
@@ -85,7 +86,7 @@ export class NotionSync {
         }
 
         // Fetch and process one chunk
-        const chunkResult = await this.processChunk(state);
+        const chunkResult = await this.processChunk(state, maxPages);
         hasMore = chunkResult.hasMore;
         state.cursor = chunkResult.nextCursor;
 
@@ -197,20 +198,30 @@ export class NotionSync {
   // PROCESS ONE CHUNK
   // ═══════════════════════════════════════════════════════════════════════════
 
-  private async processChunk(state: {
-    cursor: string | null;
-    syncStartTime: string;
-    stats: SyncStats;
-  }): Promise<{ hasMore: boolean; nextCursor: string | null }> {
+  private async processChunk(
+    state: {
+      cursor: string | null;
+      syncStartTime: string;
+      stats: SyncStats;
+    },
+    maxPages?: number
+  ): Promise<{ hasMore: boolean; nextCursor: string | null }> {
 
-    // Fetch chunk from Notion
-    const response = await this.fetchNotionChunk(state.cursor);
+    // Fetch chunk from Notion (use smaller chunk if maxPages is set)
+    const chunkSize = maxPages ? Math.min(CHUNK_SIZE, maxPages - state.stats.processed) : CHUNK_SIZE;
+    const response = await this.fetchNotionChunk(state.cursor, chunkSize);
     const pages = this.filterPages(response.results);
 
     console.log(`\n[Chunk] Fetched ${pages.length} pages (cursor: ${state.cursor ? 'yes' : 'start'})`);
 
     // Process each page
     for (const page of pages) {
+      // Check if we've hit the limit
+      if (maxPages && state.stats.processed >= maxPages) {
+        console.log(`  ⏸️  Reached maxPages limit (${maxPages})`);
+        return { hasMore: false, nextCursor: null };
+      }
+
       try {
         await this.processPage(page, state);
       } catch (error) {
@@ -218,6 +229,11 @@ export class NotionSync {
         state.stats.errored++;
       }
       state.stats.processed++;
+    }
+
+    // If we have a maxPages limit and we've reached it, stop
+    if (maxPages && state.stats.processed >= maxPages) {
+      return { hasMore: false, nextCursor: null };
     }
 
     return {
@@ -234,6 +250,7 @@ export class NotionSync {
     page: NotionPageMeta,
     state: { syncStartTime: string; stats: SyncStats }
   ): Promise<void> {
+    console.log(`  → Processing: ${page.title.substring(0, 50)}...`);
     const existing = await this.firestore.getDocument('notion', page.id);
 
     if (!existing) {
@@ -267,7 +284,9 @@ export class NotionSync {
 
   private async syncNewPage(page: NotionPageMeta, syncStartTime: string): Promise<void> {
     // Fetch content
+    const fetchStart = Date.now();
     const content = await this.getPageContent(page.id);
+    console.log(`    ⏱ Content fetched in ${Date.now() - fetchStart}ms`);
     const contentHash = calculateContentHash(content);
 
     // Format for vector store
@@ -309,7 +328,9 @@ export class NotionSync {
     syncStartTime: string
   ): Promise<void> {
     // Fetch new content
+    const fetchStart = Date.now();
     const content = await this.getPageContent(page.id);
+    console.log(`    ⏱ Content fetched in ${Date.now() - fetchStart}ms`);
     const contentHash = calculateContentHash(content);
 
     // Check if content actually changed
@@ -381,7 +402,7 @@ export class NotionSync {
   // NOTION API HELPERS
   // ═══════════════════════════════════════════════════════════════════════════
 
-  private async fetchNotionChunk(cursor: string | null): Promise<{
+  private async fetchNotionChunk(cursor: string | null, chunkSize: number = CHUNK_SIZE): Promise<{
     results: PageObjectResponse[];
     has_more: boolean;
     next_cursor: string | null;
@@ -391,7 +412,7 @@ export class NotionSync {
         () => this.notion.search({
           filter: { property: 'object', value: 'page' },
           sort: { direction: 'descending', timestamp: 'last_edited_time' },
-          page_size: CHUNK_SIZE,
+          page_size: chunkSize,
           start_cursor: cursor || undefined,
         }),
         { maxRetries: 3, retryOn: isRateLimitError }

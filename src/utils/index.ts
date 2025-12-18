@@ -55,46 +55,37 @@ export function calculateContentHash(content: string): string {
 }
 
 /**
- * Rate limiter class for API calls
+ * Smart rate limiter - only delays when actually needed
+ * Tracks request timestamps and only waits if we're going too fast
  */
 export class RateLimiter {
-  private queue: Array<() => void> = [];
-  private running = 0;
+  private requestTimes: number[] = [];
   
   constructor(
-    private readonly maxConcurrent: number,
-    private readonly delayMs: number
+    private readonly maxRequests: number,    // e.g., 3
+    private readonly windowMs: number         // e.g., 1000 (1 second)
   ) {}
   
   async execute<T>(fn: () => Promise<T>): Promise<T> {
-    await this.acquire();
-    try {
-      return await fn();
-    } finally {
-      await sleep(this.delayMs);
-      this.release();
-    }
+    await this.waitIfNeeded();
+    this.requestTimes.push(Date.now());
+    return fn();
   }
   
-  private acquire(): Promise<void> {
-    return new Promise(resolve => {
-      if (this.running < this.maxConcurrent) {
-        this.running++;
-        resolve();
-      } else {
-        this.queue.push(() => {
-          this.running++;
-          resolve();
-        });
+  private async waitIfNeeded(): Promise<void> {
+    const now = Date.now();
+    const windowStart = now - this.windowMs;
+    
+    // Remove old timestamps outside the window
+    this.requestTimes = this.requestTimes.filter(t => t > windowStart);
+    
+    // If we're at the limit, wait until the oldest request exits the window
+    if (this.requestTimes.length >= this.maxRequests) {
+      const oldestInWindow = this.requestTimes[0];
+      const waitTime = oldestInWindow + this.windowMs - now + 10; // +10ms buffer
+      if (waitTime > 0) {
+        await sleep(waitTime);
       }
-    });
-  }
-  
-  private release(): void {
-    this.running--;
-    const next = this.queue.shift();
-    if (next) {
-      next();
     }
   }
 }

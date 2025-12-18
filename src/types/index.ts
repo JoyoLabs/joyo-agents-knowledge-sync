@@ -8,10 +8,14 @@ export interface SyncState {
   lastRunAt?: string;
 
   // Streaming sync support
-  cursor?: string | null;           // Notion API cursor for resuming
+  cursor?: string | null;           // API cursor for resuming (Notion page cursor, Slack message cursor)
   syncStartTime?: string | null;    // When this sync run started (for delete detection)
   stopRequested?: boolean;          // Kill switch
   stats?: SyncStats;
+
+  // Slack-specific: track which channel we're processing
+  currentChannelIndex?: number;     // Index into channel list
+  currentChannelCursor?: string | null;  // Cursor within current channel
 }
 
 export interface SyncStats {
@@ -34,6 +38,10 @@ export interface KnowledgeDocument {
   createdAt: string;
   updatedAt: string;
   lastSeenAt?: string;  // When this doc was last confirmed to exist in source
+
+  // Slack-specific fields for change detection
+  replyCount?: number;    // Number of thread replies (to detect new replies)
+  editedTs?: string;      // Timestamp of last edit (to detect edits)
 }
 
 // Notion types
@@ -61,6 +69,10 @@ export interface SlackMessage {
   threadReplies?: SlackThreadReply[];
   permalink: string;
   timestamp: string;
+
+  // For change detection
+  replyCount?: number;    // Number of thread replies
+  editedTs?: string;      // Timestamp of last edit (if edited)
 }
 
 export interface SlackThreadReply {
