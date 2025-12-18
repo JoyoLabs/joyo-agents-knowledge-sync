@@ -2,7 +2,7 @@
 
 export interface SyncState {
   lastSyncTimestamp: string | null;
-  status: 'idle' | 'running' | 'completed' | 'failed';
+  status: 'idle' | 'running' | 'timeout' | 'completed' | 'failed';
   totalDocuments: number;
   lastError?: string;
   lastRunAt?: string;

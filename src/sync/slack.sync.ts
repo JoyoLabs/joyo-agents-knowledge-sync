@@ -106,7 +106,16 @@ export class SlackSync {
         if (await this.shouldStop()) {
           console.log('\n⏸️  Stopping: timeout or stop requested');
           await this.saveCheckpoint(state, i, null);
-          break;
+          await this.firestore.setTimeoutStatus('slack');
+          // Return early - don't call complete()
+          result.processed.added = state.stats?.added || 0;
+          result.processed.updated = state.stats?.updated || 0;
+          result.processed.deleted = state.stats?.deleted || 0;
+          result.processed.errored = state.stats?.errored || 0;
+          result.durationMs = Date.now() - this.startTime;
+          console.log(`\n=== Slack Sync Paused in ${(result.durationMs / 1000).toFixed(1)}s ===`);
+          console.log(`Results: +${result.processed.added} ~${result.processed.updated} -${result.processed.deleted} !${result.processed.errored}`);
+          return result;
         }
 
         // Check maxMessages limit
@@ -176,7 +185,8 @@ export class SlackSync {
   private async initialize(): Promise<SyncState> {
     const existing = await this.firestore.getSyncState('slack');
 
-    if (existing?.status === 'running' && existing.syncStartTime) {
+    // Resume from checkpoint? (status 'running' or 'timeout' with syncStartTime)
+    if ((existing?.status === 'running' || existing?.status === 'timeout') && existing.syncStartTime) {
       // Resume from checkpoint
       console.log('=== Slack Sync RESUMING ===');
       console.log(`  Resuming from channel ${existing.currentChannelIndex || 0}`);

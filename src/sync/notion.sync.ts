@@ -74,6 +74,7 @@ export class NotionSync {
         if (stopReason) {
           console.log(`\n⏸️  Stopping: ${stopReason}`);
           await this.firestore.saveCheckpoint('notion', state.cursor, state.stats);
+          await this.firestore.setTimeoutStatus('notion');
           result.processed = {
             added: state.stats.added,
             updated: state.stats.updated,
@@ -152,8 +153,8 @@ export class NotionSync {
   }> {
     const saved = await this.firestore.getSyncState('notion');
 
-    // Resume from checkpoint?
-    if (saved?.status === 'running' && saved.cursor && saved.syncStartTime) {
+    // Resume from checkpoint? (status 'running' or 'timeout' with cursor)
+    if ((saved?.status === 'running' || saved?.status === 'timeout') && saved.cursor && saved.syncStartTime) {
       return {
         cursor: saved.cursor,
         syncStartTime: saved.syncStartTime,

@@ -114,8 +114,12 @@ The Notion sync uses a **streaming, resumable architecture** to handle large wor
 - **Streaming**: Never holds all pages in memory. Processes 20 pages at a time.
 - **Resumable**: Saves cursor after each chunk. Can resume from any point.
 - **Killable**: Check `stopRequested` flag after each chunk (~30s max to stop).
-- **Timeout-aware**: Exits gracefully at 55 min, resumes next run.
+- **Timeout-aware**: Exits gracefully at 55 min, **stays "running"** to resume next run.
 - **Delete detection**: Uses `lastSeenAt` timestamp on each document.
+
+### Timeout Behavior
+
+On timeout, Notion sets `status: "timeout"` with cursor intact. Next trigger resumes from exact cursor position (skips already-processed pages entirely).
 
 ### Memory Usage
 
@@ -168,6 +172,10 @@ The Slack sync uses the same **streaming, resumable architecture** as Notion:
 - **Edited messages**: `editedTs` changed
 - **Thread updates**: `replyCount` increased
 
+### Timeout Behavior
+
+On timeout, Slack sets `status: "timeout"` with channel index intact. Next trigger resumes from exact channel position (same as Notion).
+
 ### Control Endpoints
 
 | Endpoint | Purpose |
@@ -215,7 +223,7 @@ Each `KnowledgeDocument` tracks its own state:
 Tracks sync progress per source:
 ```typescript
 {
-  status: 'idle' | 'running' | 'completed' | 'failed',
+  status: 'idle' | 'running' | 'timeout' | 'completed' | 'failed',
   lastSyncTimestamp: string,
   totalDocuments: number,
   syncStartTime?: string,    // For delete detection

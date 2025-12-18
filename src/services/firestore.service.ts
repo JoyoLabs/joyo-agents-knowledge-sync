@@ -93,6 +93,10 @@ export class FirestoreService {
     await this.updateSyncState(source, { stopRequested: true });
   }
 
+  async setTimeoutStatus(source: 'notion' | 'slack'): Promise<void> {
+    await this.updateSyncState(source, { status: 'timeout' });
+  }
+
   async resetSync(source: 'notion' | 'slack'): Promise<void> {
     // Use direct update with FieldValue.delete() for fields we want to remove
     await this.db.collection(COLLECTION_SYNC_STATE).doc(source).set({
