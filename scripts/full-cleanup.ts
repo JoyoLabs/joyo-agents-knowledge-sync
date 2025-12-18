@@ -59,9 +59,9 @@ async function clearFirestore(): Promise<void> {
     console.log(`    Deleted ${Math.min(i + batchSize, docs.length)}/${docs.length}`);
   }
   
-  // Reset sync_states
-  console.log('\n  Resetting sync_states...');
-  const states = await firestore.collection('sync_states').listDocuments();
+  // Reset knowledge_sync_state
+  console.log('\n  Resetting knowledge_sync_state...');
+  const states = await firestore.collection('knowledge_sync_state').listDocuments();
   for (const state of states) {
     await state.delete();
     console.log(`    Deleted ${state.id}`);
