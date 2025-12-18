@@ -94,13 +94,16 @@ export class FirestoreService {
   }
 
   async resetSync(source: 'notion' | 'slack'): Promise<void> {
-    await this.updateSyncState(source, {
+    // Use direct update with FieldValue.delete() for fields we want to remove
+    await this.db.collection(COLLECTION_SYNC_STATE).doc(source).set({
       status: 'idle',
+      lastSyncTimestamp: null,
+      totalDocuments: 0,
       cursor: null,
       syncStartTime: null,
       stopRequested: false,
-      stats: undefined,
-      lastError: undefined,
+      currentChannelIndex: null,
+      currentChannelCursor: null,
     });
   }
 
