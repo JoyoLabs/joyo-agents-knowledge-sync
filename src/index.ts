@@ -7,7 +7,7 @@ import { getNotionConfig, getSlackConfig } from './config';
 
 /**
  * Sync Notion pages to OpenAI Vector Store
- * Triggered by Cloud Scheduler (notion-sync-scheduler) every 6 hours
+ * Called by Cloud Scheduler daily at 2:00 AM UTC
  */
 functions.http('syncNotion', async (req: Request, res: Response) => {
   console.log('=== Notion Sync Started ===');
@@ -46,7 +46,7 @@ functions.http('syncNotion', async (req: Request, res: Response) => {
 
 /**
  * Sync Slack messages to OpenAI Vector Store
- * Triggered by Cloud Scheduler (slack-sync-scheduler) every 6 hours (offset 30min)
+ * Called by Cloud Scheduler daily at 2:30 AM UTC
  */
 functions.http('syncSlack', async (req: Request, res: Response) => {
   console.log('=== Slack Sync Started ===');

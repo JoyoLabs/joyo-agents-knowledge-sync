@@ -17,7 +17,7 @@ npm run build
 
 echo -e "${YELLOW}Deploying Cloud Functions...${NC}"
 
-# Deploy all functions in parallel
+# Deploy sync functions (called by Cloud Scheduler)
 gcloud functions deploy syncNotion \
   --gen2 \
   --runtime=$RUNTIME \
@@ -121,11 +121,40 @@ gcloud functions deploy resetSlackSync \
 # Wait for all deployments to complete
 wait
 
+echo -e "${YELLOW}Setting up Cloud Scheduler jobs...${NC}"
+
+# Delete existing scheduler jobs if they exist (to update them)
+gcloud scheduler jobs delete notion-sync-daily --location=$REGION --project=$PROJECT --quiet 2>/dev/null || true
+gcloud scheduler jobs delete slack-sync-daily --location=$REGION --project=$PROJECT --quiet 2>/dev/null || true
+
+# Create Cloud Scheduler jobs with HTTP targets
+# Notion sync at 2:00 AM UTC daily
+gcloud scheduler jobs create http notion-sync-daily \
+  --location=$REGION \
+  --schedule="0 2 * * *" \
+  --uri="https://$REGION-$PROJECT.cloudfunctions.net/syncNotion" \
+  --http-method=POST \
+  --time-zone="UTC" \
+  --project=$PROJECT \
+  --quiet
+
+# Slack sync at 2:30 AM UTC daily (30min offset from Notion)
+gcloud scheduler jobs create http slack-sync-daily \
+  --location=$REGION \
+  --schedule="30 2 * * *" \
+  --uri="https://$REGION-$PROJECT.cloudfunctions.net/syncSlack" \
+  --http-method=POST \
+  --time-zone="UTC" \
+  --project=$PROJECT \
+  --quiet
+
 echo -e "${GREEN}All functions deployed successfully!${NC}"
 echo ""
-echo "Endpoints:"
-echo "  https://$REGION-$PROJECT.cloudfunctions.net/syncNotion"
-echo "  https://$REGION-$PROJECT.cloudfunctions.net/syncSlack"
+echo "Scheduled Functions (via Cloud Scheduler):"
+echo "  syncNotion - daily at 2:00 AM UTC"
+echo "  syncSlack  - daily at 2:30 AM UTC"
+echo ""
+echo "HTTP Endpoints:"
 echo "  https://$REGION-$PROJECT.cloudfunctions.net/getSyncStatus"
 echo ""
 echo "Control endpoints:"
@@ -133,3 +162,7 @@ echo "  https://$REGION-$PROJECT.cloudfunctions.net/stopNotionSync"
 echo "  https://$REGION-$PROJECT.cloudfunctions.net/resetNotionSync"
 echo "  https://$REGION-$PROJECT.cloudfunctions.net/stopSlackSync"
 echo "  https://$REGION-$PROJECT.cloudfunctions.net/resetSlackSync"
+echo ""
+echo "To manually trigger syncs (via Cloud Scheduler):"
+echo "  gcloud scheduler jobs run notion-sync-daily --location=$REGION --project=$PROJECT"
+echo "  gcloud scheduler jobs run slack-sync-daily --location=$REGION --project=$PROJECT"
