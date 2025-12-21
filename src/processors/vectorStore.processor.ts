@@ -132,8 +132,18 @@ export class VectorStoreProcessor {
         }
 
         // Delete the file itself
-        await this.openai.files.del(fileId);
-        console.log(`Deleted: ${fileId}`);
+        try {
+          await this.openai.files.del(fileId);
+          console.log(`Deleted: ${fileId}`);
+        } catch (error: unknown) {
+          // Handle 404 - file already deleted (OK to ignore)
+          const apiError = error as { status?: number };
+          if (apiError.status === 404) {
+            console.log(`File already deleted from OpenAI: ${fileId}`);
+          } else {
+            throw error;  // Re-throw other errors
+          }
+        }
       },
       {
         maxRetries: this.config.retries,
